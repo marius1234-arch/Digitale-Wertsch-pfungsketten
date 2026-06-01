@@ -1,0 +1,470 @@
+import os
+import sqlite3
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+# ---------------------------------------------------------------------------
+# Konstanten
+# ---------------------------------------------------------------------------
+MONATE = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun",
+          "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"]
+
+DEFAULT_DB = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "Programm", "Datenbank", "HistorischeVerkaufsdatenAmazon.db",
+)
+
+
+# ---------------------------------------------------------------------------
+# Datengenerator (wird aufgerufen wenn DB fehlt, z. B. auf Streamlit Cloud)
+# ---------------------------------------------------------------------------
+def erstelle_datenbank(db_pfad: str) -> None:
+    """Erstellt und befüllt die SQLite-Datenbank mit simulierten Verkaufsdaten."""
+    os.makedirs(os.path.dirname(db_pfad), exist_ok=True)
+    con = sqlite3.connect(db_pfad)
+    cur = con.cursor()
+
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS products (
+            product_id   INTEGER PRIMARY KEY,
+            name         TEXT NOT NULL,
+            season_type  TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS cost_parameters (
+            product_id          INTEGER PRIMARY KEY REFERENCES products(product_id),
+            cost_underage_eur   REAL NOT NULL,
+            cost_overage_eur    REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sales_history (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id      INTEGER NOT NULL REFERENCES products(product_id),
+            year            INTEGER NOT NULL,
+            month           INTEGER NOT NULL,
+            sales_quantity  INTEGER NOT NULL
+        );
+    """)
+
+    # Produkte
+    cur.executemany(
+        "INSERT OR IGNORE INTO products VALUES (?,?,?)",
+        [
+            (1, "Pool-Zubehör",    "summer"),
+            (2, "Heizdecke",       "winter"),
+            (3, "Gartenleuchten",  "spring_summer"),
+        ],
+    )
+
+    # Kostenparam.
+    cur.executemany(
+        "INSERT OR IGNORE INTO cost_parameters VALUES (?,?,?)",
+        [
+            (1, 17.99, 6.00),
+            (2, 31.90, 9.70),
+            (3, 13.50, 4.40),
+        ],
+    )
+
+    # Historische Verkaufsdaten 2023–2025
+    rng = np.random.default_rng(42)
+
+    def _basis(peak_months, peak_mu, off_mu, noise=20):
+        mu = np.where(np.isin(np.arange(1, 13), peak_months), peak_mu, off_mu)
+        return mu, noise
+
+    configs = {
+        1: _basis([5, 6, 7, 8],         555, 80,  25),   # Pool-Zubehör
+        2: _basis([11, 12, 1, 2],        560, 70,  25),   # Heizdecke
+        3: _basis([3, 4, 5, 6, 7, 8, 9], 335, 60,  20),  # Gartenleuchten
+    }
+
+    rows = []
+    for pid, (mu_arr, noise) in configs.items():
+        for year in [2023, 2024, 2025]:
+            for month in range(1, 13):
+                qty = int(max(0, rng.normal(mu_arr[month - 1], noise)))
+                rows.append((pid, year, month, qty))
+
+    cur.executemany(
+        "INSERT INTO sales_history (product_id, year, month, sales_quantity) VALUES (?,?,?,?)",
+        rows,
+    )
+
+    con.commit()
+    con.close()
+
+# ---------------------------------------------------------------------------
+# Datenzugriff
+# ---------------------------------------------------------------------------
+@st.cache_data
+def lade_daten(db_pfad: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    con = sqlite3.connect(db_pfad)
+    produkte = pd.read_sql_query(
+        """
+        SELECT p.product_id, p.name, p.season_type,
+               c.cost_underage_eur AS cu,
+               c.cost_overage_eur  AS co
+        FROM products p
+        JOIN cost_parameters c ON c.product_id = p.product_id
+        ORDER BY p.product_id
+        """,
+        con,
+    )
+    verkauf = pd.read_sql_query(
+        """
+        SELECT product_id, year, month, sales_quantity
+        FROM sales_history
+        ORDER BY product_id, year, month
+        """,
+        con,
+    )
+    con.close()
+    return produkte, verkauf
+
+
+# ---------------------------------------------------------------------------
+# Berechnung
+# ---------------------------------------------------------------------------
+def empirisches_q_star(werte, cr: float) -> int:
+    """
+    Empirisches Newsvendor-Quantil (Sample Average Approximation).
+    Q* ist der kleinste beobachtete Wert, dessen kumulative relative
+    Häufigkeit das kritische Fraktil CR erreicht oder überschreitet.
+    Das entspricht der ceil(CR * n)-ten Ordnungsstatistik der aufsteigend
+    sortierten Beobachtungen und ist die exakte SAA-Newsvendor-Lösung.
+    """
+    sortiert = np.sort(np.asarray(werte))
+    n = len(sortiert)
+    k = int(np.ceil(cr * n - 1e-9))
+    k = min(max(k, 1), n)
+    return int(sortiert[k - 1])
+
+
+def berechne_ergebnisse(verkauf: pd.DataFrame, produkte: pd.DataFrame) -> pd.DataFrame:
+    """
+    Relative Häufigkeit: Jeder historische Monatswert bekommt gleiches Gewicht.
+    Q* = empirisches Quantil bei CR — kein Normalverteilungs-Fitting.
+    μ und σ werden nur zur Anzeige mitberechnet.
+    """
+    prod_info = produkte.set_index("product_id")[["name", "season_type", "cu", "co"]]
+
+    rows = []
+    for (pid, month), grp in verkauf.groupby(["product_id", "month"]):
+        vals = grp["sales_quantity"].values
+        prod = prod_info.loc[pid]
+        cr   = prod["cu"] / (prod["cu"] + prod["co"])
+        rows.append({
+            "product_id":     pid,
+            "month":          month,
+            "name":           prod["name"],
+            "season_type":    prod["season_type"],
+            "cu":             prod["cu"],
+            "co":             prod["co"],
+            "critical_ratio": cr,
+            "mu":      vals.mean(),
+            "min_val": int(vals.min()),
+            "max_val": int(vals.max()),
+            "Q_star":  empirisches_q_star(vals, cr),
+        })
+
+    df = pd.DataFrame(rows)
+    df["monat_name"] = df["month"].apply(lambda m: MONATE[m - 1])
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Hilfsfunktionen UI
+# ---------------------------------------------------------------------------
+SEASON_LABELS = {
+    "summer":        "Sommer",
+    "winter":        "Winter",
+    "spring_summer": "Frühjahr/Sommer",
+    "all_year":      "Ganzjährig",
+}
+
+
+def zeige_produkt(prod: pd.Series, df: pd.DataFrame) -> None:
+    season = SEASON_LABELS.get(prod["season_type"], prod["season_type"])
+    cr = prod["cu"] / (prod["cu"] + prod["co"])
+
+    st.subheader(f"{prod['name']}")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Saisontyp", season)
+    m2.metric("Cu (Unterbevorratung)", f"{prod['cu']:.2f} €")
+    m3.metric("Co (Überbevorratung)", f"{prod['co']:.2f} €")
+    m4.metric("Kritisches Fraktil", f"{cr:.1%}")
+
+    col_chart, col_table = st.columns([3, 2], gap="large")
+
+    with col_chart:
+        _zeige_chart(df)
+
+    with col_table:
+        _zeige_tabelle(df)
+
+
+def _zeige_chart(df: pd.DataFrame) -> None:
+    fig = go.Figure()
+
+    # Min/Max-Band aus historischen Beobachtungen
+    fig.add_trace(go.Scatter(
+        x=df["monat_name"].tolist() + df["monat_name"].tolist()[::-1],
+        y=df["max_val"].tolist() + df["min_val"].tolist()[::-1],
+        fill="toself",
+        fillcolor="rgba(99,110,250,0.12)",
+        line=dict(color="rgba(0,0,0,0)"),
+        name="Beobachteter Bereich (Min–Max)",
+        hoverinfo="skip",
+    ))
+
+    # Durchschnittsnachfrage μ
+    fig.add_trace(go.Scatter(
+        x=df["monat_name"], y=df["mu"].round(1),
+        mode="lines+markers",
+        name="Ø Nachfrage (Durchschnitt)",
+        line=dict(color="#636EFA", width=2, dash="dash"),
+        marker=dict(size=5),
+    ))
+
+    # Optimale Bestellmenge Q*
+    fig.add_trace(go.Scatter(
+        x=df["monat_name"], y=df["Q_star"],
+        mode="lines+markers",
+        name="Opt. Bestellmenge Q*",
+        line=dict(color="#EF553B", width=2.5),
+        marker=dict(size=6),
+    ))
+
+    fig.update_layout(
+        xaxis_title="Monat",
+        yaxis_title="Menge (Einheiten)",
+        legend=dict(orientation="h", yanchor="top", y=-0.25, xanchor="center", x=0.5),
+        height=430,
+        margin=dict(l=10, r=10, t=20, b=110),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _zeige_tabelle(df: pd.DataFrame) -> None:
+    tbl = df[["monat_name", "mu", "Q_star"]].copy()
+    tbl.columns = ["Monat", "Ø Nachfrage", "Bestellmenge Q*"]
+    tbl["Ø Nachfrage"] = tbl["Ø Nachfrage"].round(1)
+    st.dataframe(
+        tbl,
+        use_container_width=True,
+        hide_index=True,
+        height=458,
+        column_config={
+            "Ø Nachfrage": st.column_config.NumberColumn(
+                "Ø Nachfrage",
+                help="Durchschnittlicher Absatz in diesem Monat über alle historischen Jahre",
+            ),
+            "Bestellmenge Q*": st.column_config.NumberColumn(
+                "Bestellmenge Q*",
+                help="Optimale Bestellmenge laut Newsvendor-Modell",
+            ),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# App-Layout
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Newsvendor-Analyse | Gruppe 6",
+    page_icon="📦",
+    layout="wide",
+)
+
+st.title("📦 Stochastische Bestandsoptimierung")
+st.caption("Gruppe 6 · Digitale Wertschöpfungskette · Newsvendor-Modell mit relativer Häufigkeit")
+
+# Sidebar
+with st.sidebar:
+    st.header("Einstellungen")
+    db_pfad = st.text_input(
+        "Datenbankpfad",
+        value=DEFAULT_DB,
+        help="Pfad zur SQLite-Datenbank. Mehrere Datenbanken möglich.",
+    )
+    st.caption("Die Berechnung erfolgt ausschließlich in Python — die Datenbank wird nur gelesen.")
+
+# Daten laden — DB automatisch erstellen falls nicht vorhanden (z. B. Streamlit Cloud)
+if not os.path.exists(db_pfad):
+    if db_pfad == DEFAULT_DB:
+        erstelle_datenbank(db_pfad)
+    else:
+        st.warning(f"Datenbankdatei nicht gefunden:\n`{db_pfad}`\n\nBitte Pfad in der Sidebar anpassen.")
+        st.stop()
+
+try:
+    produkte, verkauf = lade_daten(db_pfad)
+except Exception as e:
+    st.error(f"Fehler beim Laden der Datenbank: {e}")
+    st.stop()
+
+# Berechnung
+ergebnisse = berechne_ergebnisse(verkauf, produkte)
+
+tab_ergebnisse, tab_heatmap, tab_berechnung = st.tabs(
+    ["Ergebnisse", "Übersicht (Heatmap)", "Berechnungsweg Nachfrageprognose"]
+)
+
+# ---------------------------------------------------------------------------
+# Tab 1: Ergebnisse
+# ---------------------------------------------------------------------------
+with tab_ergebnisse:
+    for _, prod in produkte.iterrows():
+        df_prod = (
+            ergebnisse[ergebnisse["product_id"] == prod["product_id"]]
+            .sort_values("month")
+            .reset_index(drop=True)
+        )
+        zeige_produkt(prod, df_prod)
+        st.divider()
+
+# ---------------------------------------------------------------------------
+# Tab 2: Übersicht (Heatmap)
+# ---------------------------------------------------------------------------
+with tab_heatmap:
+    st.markdown(
+        """
+        ### Übersicht aller optimalen Bestellmengen
+
+        Die Heatmap zeigt alle **36 Q\\*-Werte** (3 Produkte × 12 Monate) auf einen Blick.
+        Dunklere Felder entsprechen niedrigeren, hellere Felder höheren Bestellmengen.
+        """
+    )
+
+    pivot = (
+        ergebnisse
+        .pivot(index="product_id", columns="month", values="Q_star")
+        .reindex(index=produkte["product_id"].tolist(), columns=list(range(1, 13)))
+    )
+    z_werte     = pivot.values
+    x_labels    = MONATE
+    y_labels    = produkte["name"].tolist()
+
+    fig_hm = go.Figure(data=go.Heatmap(
+        z=z_werte,
+        x=x_labels,
+        y=y_labels,
+        colorscale="Viridis",
+        colorbar=dict(title="Q*"),
+        texttemplate="%{z}",
+        textfont=dict(size=13),
+        hovertemplate="Produkt: %{y}<br>Monat: %{x}<br>Q* = %{z}<extra></extra>",
+    ))
+    fig_hm.update_layout(
+        xaxis_title="Monat",
+        yaxis_title="Produkt",
+        yaxis=dict(autorange="reversed"),
+        height=380,
+        margin=dict(l=10, r=10, t=20, b=40),
+    )
+    st.plotly_chart(fig_hm, use_container_width=True)
+
+    st.caption(
+        "Saisonmuster gut erkennbar: Pool-Zubehör mit Peak im Sommer (Mai–Aug), "
+        "Heizdecke mit Peak im Winter (Nov–Feb), Gartenleuchten über Frühjahr "
+        "bis Frühherbst (Mär–Sep)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tab 3: Berechnungsweg Nachfrageprognose
+# ---------------------------------------------------------------------------
+with tab_berechnung:
+    st.markdown(
+        """
+        ### Wie wird die Nachfrageprognose berechnet?
+
+        **Methode: Relative Häufigkeit**
+
+        Jeder historische Jahreswert bekommt das gleiche Gewicht (1 / Anzahl Jahre).
+        Die Werte werden aufsteigend sortiert und die kumulative Häufigkeit aufgebaut.
+        Q\\* ist der kleinste beobachtete Wert, bei dem die kumulative Häufigkeit das
+        **kritische Fraktil** (CR = Cu / (Cu + Co)) erreicht oder überschreitet.
+        """
+    )
+    st.divider()
+
+    sel_col1, sel_col2 = st.columns(2)
+    with sel_col1:
+        produkt_name = st.selectbox(
+            "Produkt",
+            options=produkte["name"].tolist(),
+        )
+    with sel_col2:
+        monat_idx = st.selectbox(
+            "Monat",
+            options=list(range(1, 13)),
+            format_func=lambda m: MONATE[m - 1],
+        )
+
+    # Produktzeile und Verkaufsdaten für Auswahl
+    prod_row  = produkte[produkte["name"] == produkt_name].iloc[0]
+    cr        = prod_row["cu"] / (prod_row["cu"] + prod_row["co"])
+    hist_vals = (
+        verkauf[
+            (verkauf["product_id"] == prod_row["product_id"]) &
+            (verkauf["month"] == monat_idx)
+        ]
+        .sort_values("sales_quantity")
+        [["year", "sales_quantity"]]
+        .reset_index(drop=True)
+    )
+
+    n = len(hist_vals)
+    hist_vals["Rel. Häufigkeit"]  = 1 / n
+    hist_vals["Kum. Häufigkeit"]  = hist_vals["Rel. Häufigkeit"].cumsum()
+    q_star = empirisches_q_star(hist_vals["sales_quantity"].values, cr)
+    hist_vals["→ Q*?"] = hist_vals["sales_quantity"].apply(
+        lambda v: "✓ Q* hier" if v == q_star else ""
+    )
+
+    st.markdown(
+        f"**{produkt_name} — {MONATE[monat_idx - 1]}** · "
+        f"Cu = {prod_row['cu']:.2f} € · Co = {prod_row['co']:.2f} € · "
+        f"**CR = {cr:.1%}** · **Q\\* = {q_star}**"
+    )
+
+    tbl_display = hist_vals.copy()
+    tbl_display.columns = ["Jahr", "Verkäufe", "Rel. Häufigkeit", "Kum. Häufigkeit", "→ Q*?"]
+    tbl_display["Rel. Häufigkeit"] = tbl_display["Rel. Häufigkeit"].apply(lambda x: f"{x:.1%}")
+    tbl_display["Kum. Häufigkeit"] = tbl_display["Kum. Häufigkeit"].apply(lambda x: f"{x:.1%}")
+
+    st.dataframe(tbl_display, use_container_width=False, hide_index=True)
+
+    # Balkendiagramm mit CR-Linie
+    fig2 = go.Figure()
+    farben = ["#EF553B" if v == q_star else "#636EFA" for v in hist_vals["sales_quantity"]]
+    fig2.add_trace(go.Bar(
+        x=hist_vals["sales_quantity"].astype(str) + " (" + hist_vals["year"].astype(str) + ")",
+        y=hist_vals["Kum. Häufigkeit"].round(3),
+        marker_color=farben,
+        name="Kum. Häufigkeit",
+        text=[f"{v:.1%}" for v in hist_vals["Kum. Häufigkeit"]],
+        textposition="outside",
+    ))
+    fig2.add_hline(
+        y=cr,
+        line_dash="dash",
+        line_color="orange",
+        annotation_text=f"CR = {cr:.1%}",
+        annotation_position="top right",
+    )
+    fig2.update_layout(
+        xaxis_title="Verkäufe (Jahr)",
+        yaxis_title="Kumulative Häufigkeit",
+        yaxis=dict(tickformat=".0%", range=[0, 1.15]),
+        height=350,
+        margin=dict(l=10, r=10, t=30, b=40),
+        showlegend=False,
+    )
+    st.plotly_chart(fig2, use_container_width=False)
+    st.caption(f"Rot markiert: Q* = {q_star} — erster Wert, bei dem die kumulative Häufigkeit ≥ CR ({cr:.1%})")
