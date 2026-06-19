@@ -73,6 +73,13 @@ VERKAUFSDATEN = [
     (3, 2025, 9, 220), (3, 2025, 10, 130), (3, 2025, 11, 78), (3, 2025, 12, 60),
 ]
 
+# Produkt-Stammdaten + Kostenparameter (product_id, name, season_type, cu, co)
+PRODUKTE_BAKED = [
+    (1, "Pool-Zubehör",   "summer",        17.99, 6.00),
+    (2, "Heizdecke",      "winter",        31.90, 9.70),
+    (3, "Gartenleuchten", "spring_summer", 13.50, 4.40),
+]
+
 
 # ---------------------------------------------------------------------------
 # Datengenerator (wird aufgerufen wenn DB fehlt, z. B. auf Streamlit Cloud)
@@ -164,6 +171,25 @@ def lade_daten(db_pfad: str) -> tuple[pd.DataFrame, pd.DataFrame]:
         con,
     )
     con.close()
+    return produkte, verkauf
+
+
+def lade_baked_daten() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Liefert die eingebauten Projektdaten direkt im Speicher (ohne Datei).
+    Wird als Fallback genutzt, wenn keine DB-Datei am Pfad liegt — die Werte
+    sind identisch zur lokalen Projekt-Datenbank.
+    """
+    produkte = pd.DataFrame(
+        PRODUKTE_BAKED, columns=["product_id", "name", "season_type", "cu", "co"]
+    )
+    verkauf = (
+        pd.DataFrame(
+            VERKAUFSDATEN, columns=["product_id", "year", "month", "sales_quantity"]
+        )
+        .sort_values(["product_id", "year", "month"])
+        .reset_index(drop=True)
+    )
     return produkte, verkauf
 
 
@@ -373,18 +399,24 @@ with st.sidebar:
     )
     st.caption("Die Berechnung erfolgt ausschließlich in Python — die Datenbank wird nur gelesen.")
 
-# Daten laden — DB automatisch erstellen falls nicht vorhanden (z. B. Streamlit Cloud)
-if not os.path.exists(db_pfad):
-    if db_pfad == DEFAULT_DB:
-        erstelle_datenbank(db_pfad)
-    else:
-        st.warning(f"Datenbankdatei nicht gefunden:\n`{db_pfad}`\n\nBitte Pfad in der Sidebar anpassen.")
+# Daten laden. Liegt am Pfad eine DB-Datei, wird sie gelesen. Fehlt sie (z. B. auf
+# Streamlit Cloud, wo die Datei nicht am erwarteten Pfad liegt), werden die
+# eingebauten Projektdaten direkt im Speicher genutzt — identisch zur lokalen DB
+# und ohne dass eine Datei geschrieben wird (so kann keine veraltete Datei stören).
+if os.path.exists(db_pfad):
+    try:
+        produkte, verkauf = lade_daten(db_pfad)
+    except Exception as e:
+        st.error(f"Fehler beim Laden der Datenbank: {e}")
         st.stop()
-
-try:
-    produkte, verkauf = lade_daten(db_pfad)
-except Exception as e:
-    st.error(f"Fehler beim Laden der Datenbank: {e}")
+elif db_pfad == DEFAULT_DB:
+    produkte, verkauf = lade_baked_daten()
+    st.info(
+        "Keine Datenbankdatei gefunden — es werden die eingebauten Projektdaten "
+        "verwendet (identisch zur lokalen Datenbank)."
+    )
+else:
+    st.warning(f"Datenbankdatei nicht gefunden:\n`{db_pfad}`\n\nBitte Pfad in der Sidebar anpassen.")
     st.stop()
 
 # Cu/Co interaktiv: Standardwerte aus der DB einmalig in session_state ablegen
