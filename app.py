@@ -35,6 +35,9 @@ def erstelle_datenbank(db_pfad: str) -> None:
         );
         CREATE TABLE IF NOT EXISTS cost_parameters (
             product_id          INTEGER PRIMARY KEY REFERENCES products(product_id),
+            purchase_cost_eur   REAL NOT NULL,
+            selling_price_eur   REAL NOT NULL,
+            storage_cost_eur    REAL NOT NULL,
             cost_underage_eur   REAL NOT NULL,
             cost_overage_eur    REAL NOT NULL
         );
@@ -57,17 +60,17 @@ def erstelle_datenbank(db_pfad: str) -> None:
         ],
     )
 
-    # Kostenparam.
+    # Kostenparam. (Cu = selling - purchase; Co = 0.4 * purchase + storage)
     cur.executemany(
-        "INSERT OR IGNORE INTO cost_parameters VALUES (?,?,?)",
+        "INSERT OR IGNORE INTO cost_parameters VALUES (?,?,?,?,?,?)",
         [
-            (1, 17.99, 6.00),
-            (2, 31.90, 9.70),
-            (3, 13.50, 4.40),
+            (1, 12.00, 29.99, 1.20, 17.99, 6.00),
+            (2, 18.00, 49.90, 2.50, 31.90, 9.70),
+            (3,  9.00, 22.50, 0.80, 13.50, 4.40),
         ],
     )
 
-    # Historische Verkaufsdaten 2023–2025
+    # Historische Verkaufsdaten 2021–2025 (5 Jahre = 60 Beobachtungen pro Produkt)
     rng = np.random.default_rng(42)
 
     def _basis(peak_months, peak_mu, off_mu, noise=20):
@@ -82,7 +85,7 @@ def erstelle_datenbank(db_pfad: str) -> None:
 
     rows = []
     for pid, (mu_arr, noise) in configs.items():
-        for year in [2023, 2024, 2025]:
+        for year in [2021, 2022, 2023, 2024, 2025]:
             for month in range(1, 13):
                 qty = int(max(0, rng.normal(mu_arr[month - 1], noise)))
                 rows.append((pid, year, month, qty))
@@ -185,17 +188,54 @@ SEASON_LABELS = {
 }
 
 
-def zeige_produkt(prod: pd.Series, df: pd.DataFrame) -> None:
+def _reset_cu_co(pid: int, cu_default: float, co_default: float) -> None:
+    """Setzt Cu/Co eines Produkts auf die Datenbank-Standardwerte zurück."""
+    st.session_state[f"cu_{pid}"] = float(cu_default)
+    st.session_state[f"co_{pid}"] = float(co_default)
+
+
+def zeige_produkt(prod: pd.Series, df: pd.DataFrame,
+                  cu_default: float, co_default: float) -> None:
+    pid = int(prod["product_id"])
     season = SEASON_LABELS.get(prod["season_type"], prod["season_type"])
-    cr = prod["cu"] / (prod["cu"] + prod["co"])
 
-    st.subheader(f"{prod['name']}")
+    head_l, head_r = st.columns([4, 1])
+    with head_l:
+        st.subheader(f"{prod['name']}")
+        st.caption(f"Saisontyp: {season}")
+    with head_r:
+        st.button(
+            "↺ Standardwerte",
+            key=f"reset_{pid}",
+            on_click=_reset_cu_co,
+            args=(pid, cu_default, co_default),
+            help=f"Cu/Co auf die DB-Werte zurücksetzen "
+                 f"(Cu = {cu_default:.2f} €, Co = {co_default:.2f} €)",
+        )
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Saisontyp", season)
-    m2.metric("Cu (Unterbevorratung)", f"{prod['cu']:.2f} €")
-    m3.metric("Co (Überbevorratung)", f"{prod['co']:.2f} €")
-    m4.metric("Kritisches Fraktil", f"{cr:.1%}")
+    # Interaktive Kostenparameter — Änderung aktualisiert Grafik, Tabelle und Heatmap
+    i1, i2, i3 = st.columns(3)
+    with i1:
+        cu = st.number_input(
+            "Cu — Unterbevorratung (€)",
+            min_value=0.01,
+            step=0.50,
+            format="%.2f",
+            key=f"cu_{pid}",
+            help="Entgangener Gewinn pro nicht bedienter Nachfrageeinheit",
+        )
+    with i2:
+        co = st.number_input(
+            "Co — Überbevorratung (€)",
+            min_value=0.01,
+            step=0.50,
+            format="%.2f",
+            key=f"co_{pid}",
+            help="Lager- und Restwertkosten pro überschüssiger Einheit",
+        )
+    with i3:
+        cr = cu / (cu + co)
+        st.metric("Kritisches Fraktil", f"{cr:.1%}", help="CR = Cu / (Cu + Co)")
 
     col_chart, col_table = st.columns([3, 2], gap="large")
 
@@ -307,8 +347,22 @@ except Exception as e:
     st.error(f"Fehler beim Laden der Datenbank: {e}")
     st.stop()
 
-# Berechnung
-ergebnisse = berechne_ergebnisse(verkauf, produkte)
+# Cu/Co interaktiv: Standardwerte aus der DB einmalig in session_state ablegen
+for _, _p in produkte.iterrows():
+    _pid = int(_p["product_id"])
+    st.session_state.setdefault(f"cu_{_pid}", float(_p["cu"]))
+    st.session_state.setdefault(f"co_{_pid}", float(_p["co"]))
+
+# Effektive Produkttabelle mit den (ggf. angepassten) Cu/Co aus session_state.
+# Die DB selbst wird nie verändert — Anpassungen leben nur in der Session.
+produkte_eff = produkte.copy()
+produkte_eff["cu"] = produkte_eff["product_id"].apply(
+    lambda pid: float(st.session_state[f"cu_{int(pid)}"]))
+produkte_eff["co"] = produkte_eff["product_id"].apply(
+    lambda pid: float(st.session_state[f"co_{int(pid)}"]))
+
+# Berechnung (auf Basis der effektiven Kostenparameter)
+ergebnisse = berechne_ergebnisse(verkauf, produkte_eff)
 
 tab_ergebnisse, tab_heatmap, tab_berechnung = st.tabs(
     ["Ergebnisse", "Übersicht (Heatmap)", "Berechnungsweg Nachfrageprognose"]
@@ -318,13 +372,20 @@ tab_ergebnisse, tab_heatmap, tab_berechnung = st.tabs(
 # Tab 1: Ergebnisse
 # ---------------------------------------------------------------------------
 with tab_ergebnisse:
-    for _, prod in produkte.iterrows():
+    st.info(
+        "Tipp: Passe **Cu** und **Co** je Produkt an — Grafik, Tabelle und "
+        "Heatmap aktualisieren sich sofort.",
+        icon="🎛️",
+    )
+    for _, prod in produkte_eff.iterrows():
+        pid = prod["product_id"]
         df_prod = (
-            ergebnisse[ergebnisse["product_id"] == prod["product_id"]]
+            ergebnisse[ergebnisse["product_id"] == pid]
             .sort_values("month")
             .reset_index(drop=True)
         )
-        zeige_produkt(prod, df_prod)
+        db_row = produkte[produkte["product_id"] == pid].iloc[0]
+        zeige_produkt(prod, df_prod, float(db_row["cu"]), float(db_row["co"]))
         st.divider()
 
 # ---------------------------------------------------------------------------
@@ -397,7 +458,7 @@ with tab_berechnung:
     with sel_col1:
         produkt_name = st.selectbox(
             "Produkt",
-            options=produkte["name"].tolist(),
+            options=produkte_eff["name"].tolist(),
         )
     with sel_col2:
         monat_idx = st.selectbox(
@@ -407,7 +468,7 @@ with tab_berechnung:
         )
 
     # Produktzeile und Verkaufsdaten für Auswahl
-    prod_row  = produkte[produkte["name"] == produkt_name].iloc[0]
+    prod_row  = produkte_eff[produkte_eff["name"] == produkt_name].iloc[0]
     cr        = prod_row["cu"] / (prod_row["cu"] + prod_row["co"])
     hist_vals = (
         verkauf[
