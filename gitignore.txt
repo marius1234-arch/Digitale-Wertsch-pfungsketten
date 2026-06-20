@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# SQLite Browser Projektdatei (Dev-Werkzeug, nicht für Abgabe nötig)
+*.sqbpro
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
